@@ -1,0 +1,176 @@
+import argparse
+import csv
+import os
+import subprocess
+import sys
+
+
+def run_command(command, cwd):
+    print("\n$ " + " ".join(command))
+    result = subprocess.run(command, cwd=cwd, text=True)
+    if result.returncode != 0:
+        raise SystemExit(result.returncode)
+
+
+def read_summary(path):
+    with open(path, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def as_float(row, field):
+    value = row[field]
+    if value.lower() == "nan":
+        return float("nan")
+    return float(value)
+
+
+def find_controller(rows, name):
+    for row in rows:
+        if row["controller"] == name:
+            return row
+    raise KeyError(f"Controller not found in benchmark summary: {name}")
+
+
+def relative_to_report(path, target):
+    return os.path.relpath(target, start=os.path.dirname(path)).replace("\\", "/")
+
+
+def write_report(path, rows, train_dir, benchmark_dir, model_path, scenario):
+    pd = find_controller(rows, "pd")
+    residual = find_controller(rows, "pd_ppo_residual")
+    ppo = find_controller(rows, "ppo")
+
+    pd_success = as_float(pd, "success_rate")
+    residual_success = as_float(residual, "success_rate")
+    pd_error = as_float(pd, "mean_final_attitude_error_deg")
+    residual_error = as_float(residual, "mean_final_attitude_error_deg")
+    pd_energy = as_float(pd, "mean_control_energy")
+    residual_energy = as_float(residual, "mean_control_energy")
+
+    if residual_success > pd_success:
+        verdict = "PD+PPO residual has a higher success rate than pure PD."
+    elif residual_success == pd_success and residual_error < pd_error:
+        verdict = "PD+PPO residual has the same success rate as pure PD and lower final attitude error."
+    elif residual_success == pd_success and residual_energy < pd_energy:
+        verdict = "PD+PPO residual has the same success rate as pure PD and lower control energy."
+    else:
+        verdict = "Pure PD is still better under this benchmark setting."
+
+    lines = [
+        "# Automated PD vs PD+PPO Residual Comparison",
+        "",
+        "## Scenario",
+        "",
+        f"`{scenario}`",
+        "",
+        "## Verdict",
+        "",
+        verdict,
+        "",
+        "## Key Metrics",
+        "",
+        "| Controller | Success rate | Mean final error (deg) | Mean control energy |",
+        "|---|---:|---:|---:|",
+    ]
+    for row in sorted(rows, key=lambda r: r["controller"]):
+        lines.append(
+            f"| {row['controller']} | {as_float(row, 'success_rate'):.3f} | "
+            f"{as_float(row, 'mean_final_attitude_error_deg'):.3f} | "
+            f"{as_float(row, 'mean_control_energy'):.6f} |"
+        )
+
+    lines.extend([
+        "",
+        "## PD+PPO Residual Delta Versus Pure PD",
+        "",
+        f"- Success-rate delta: {residual_success - pd_success:+.3f}",
+        f"- Final-error delta: {residual_error - pd_error:+.3f} deg",
+        f"- Control-energy delta: {residual_energy - pd_energy:+.6f}",
+        "",
+        "Negative final-error and control-energy deltas are better for PD+PPO residual.",
+        "",
+        "## Output Files",
+        "",
+        f"- Training directory: `{relative_to_report(path, train_dir)}`",
+        f"- Benchmark directory: `{relative_to_report(path, benchmark_dir)}`",
+        f"- Residual model: `{relative_to_report(path, model_path)}`",
+        f"- Benchmark summary CSV: `{relative_to_report(path, os.path.join(benchmark_dir, 'benchmark_summary.csv'))}`",
+        f"- Benchmark trial CSV: `{relative_to_report(path, os.path.join(benchmark_dir, 'benchmark_trials.csv'))}`",
+        f"- Benchmark summary plot: `{relative_to_report(path, os.path.join(benchmark_dir, 'benchmark_summary.pdf'))}`",
+        "",
+        "## Interpretation",
+        "",
+        "This pipeline tests whether PPO is useful as a residual correction on top of a classical PD controller.",
+        "The residual policy is not expected to beat PD in every setting; it should be evaluated under nonlinear actuator behavior and disturbance torque.",
+    ])
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Automate PD+PPO residual training and pure-PD comparison.")
+    parser.add_argument("--output-dir", default="automated_pd_residual_comparison")
+    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--steps-per-epoch", type=int, default=1000)
+    parser.add_argument("--train-max-steps", type=int, default=120)
+    parser.add_argument("--steps", type=int, default=500)
+    parser.add_argument("--train-angles", default="10,15,20,25,30,40,50,60,70")
+    parser.add_argument("--benchmark-angles", default="20,30,40,50,60,70")
+    parser.add_argument("--trials", type=int, default=30)
+    parser.add_argument("--residual-scale", type=float, default=0.35)
+    parser.add_argument(
+        "--scenario",
+        choices=["nominal_nonlinear", "random_disturbance", "residual_friendly"],
+        default="residual_friendly",
+    )
+    parser.add_argument("--skip-training", action="store_true")
+    args = parser.parse_args()
+
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    output_dir = os.path.abspath(args.output_dir)
+    train_dir = os.path.join(output_dir, "01_residual_training")
+    benchmark_dir = os.path.join(output_dir, "02_benchmark")
+    model_path = os.path.join(train_dir, "residual_model_weights.pickle")
+    report_path = os.path.join(output_dir, "automated_comparison_report.md")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    if not args.skip_training:
+        run_command([
+            sys.executable,
+            "residual_train.py",
+            "--output-dir", train_dir,
+            "--model-out", "residual_model_weights.pickle",
+            "--epochs", str(args.epochs),
+            "--steps-per-epoch", str(args.steps_per_epoch),
+            "--train-max-steps", str(args.train_max_steps),
+            "--steps", str(args.steps),
+            "--curriculum-angles", args.train_angles,
+            "--residual-scale", str(args.residual_scale),
+            "--scenario", args.scenario,
+        ], cwd=project_dir)
+
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Residual model not found: {model_path}")
+
+    run_command([
+        sys.executable,
+        "residual_benchmark.py",
+        "--output-dir", benchmark_dir,
+        "--model", model_path,
+        "--trials", str(args.trials),
+        "--steps", str(args.steps),
+        "--angles", args.benchmark_angles,
+        "--residual-scale", str(args.residual_scale),
+        "--scenario", args.scenario,
+    ], cwd=project_dir)
+
+    summary_path = os.path.join(benchmark_dir, "benchmark_summary.csv")
+    rows = read_summary(summary_path)
+    write_report(report_path, rows, train_dir, benchmark_dir, model_path, args.scenario)
+    print(f"\nAutomated comparison report written to: {report_path}")
+
+
+if __name__ == "__main__":
+    main()
